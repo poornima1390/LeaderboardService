@@ -401,13 +401,20 @@ distinction is the point: `deploy_on_push` reacts to the push itself, so a
 commit failing lint or tests would still ship. The deploy job `needs` all three
 gates, so a red build genuinely means "not deployed".
 
-**The deploy applies `.do/app.yaml`, not just the code.** It renders the spec
-from GitHub secrets and runs `doctl apps update --spec`, so infrastructure
-changes ship with the commit that makes them. The earlier version called
-`doctl apps create-deployment`, which redeploys using the app's *server-side
-stored* spec — so the commit attaching Valkey deployed green and changed
-nothing at all. That made `.do/app.yaml` decorative and free to drift from
-reality, which is the worst possible state for an infrastructure file.
+**The deploy applies `.do/app.yaml` *and* ships the commit.** Both halves are
+needed, and each was learned the hard way:
+
+- `doctl apps create-deployment` alone redeploys using the app's *server-side
+  stored* spec, so the commit attaching Valkey deployed green and changed
+  nothing — `.do/app.yaml` was decorative and free to drift from reality.
+- `doctl apps update --spec` alone redeploys the *previously resolved* source
+  commit rather than re-resolving the branch tip, so the Phase 3 deploy
+  reported success while the new endpoints 404'd in production.
+
+So the job does `update --spec` (infrastructure), then `create-deployment`
+(code), then **asserts the deployed commit equals the workflow's commit**.
+That last step is the real guard: "deployment ACTIVE" says nothing about
+*what* is running, which is why both failures were invisible.
 
 It then independently curls the public ingress, because App Platform's own
 health check only proves the rollout believed itself healthy, not that the URL

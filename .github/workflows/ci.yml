@@ -264,21 +264,31 @@ jobs:
           doctl apps spec validate /tmp/app-spec.yaml > /dev/null
           echo "Spec validated."
 
-      - name: Deploy
+      - name: Apply the spec
+        # Applies infrastructure changes. Deliberately NOT the whole deploy:
+        # `apps update --spec` redeploys the *previously resolved* source
+        # commit for a git source rather than re-resolving the branch tip, so
+        # on its own it ships infrastructure changes and silently keeps serving
+        # stale code. That is exactly how a Phase 3 deploy reported success
+        # while the new endpoints 404'd in production.
+        #
+        # No-op when the spec is unchanged, so this is cheap on most deploys.
+        run: |
+          doctl apps update "${{ steps.app.outputs.app_id }}" \
+            --spec /tmp/app-spec.yaml --wait --format ID --no-header
+
+      - name: Deploy this commit
         id: deploy
-        # `apps update --spec` applies any infrastructure change AND triggers a
-        # deployment from the branch the spec pins, so one command keeps the
-        # running app and the committed spec in step. --wait blocks until the
-        # rollout is ACTIVE or has failed, which is what makes a red build mean
-        # "not deployed".
+        # `create-deployment` re-resolves the branch the spec pins, so this is
+        # what actually ships the code. --wait blocks until the rollout is
+        # ACTIVE or has failed, which is what makes a red build mean "not
+        # deployed".
         run: |
           set -o pipefail
-          doctl apps update "${{ steps.app.outputs.app_id }}" \
-            --spec /tmp/app-spec.yaml --wait --format ID,Spec.Name --no-header \
-            | tee /tmp/deploy.txt
+          doctl apps create-deployment "${{ steps.app.outputs.app_id }}" --wait \
+            --format ID,Phase --no-header | tee /tmp/deploy.txt
 
-          phase=$(doctl apps list-deployments "${{ steps.app.outputs.app_id }}" \
-            --format Phase --no-header | head -1)
+          phase=$(awk '{print $2}' /tmp/deploy.txt | tail -1)
           if [ "$phase" != "ACTIVE" ]; then
             echo "::error::Deployment finished in phase $phase"
             exit 1
@@ -286,6 +296,24 @@ jobs:
           app_url=$(doctl apps get "${{ steps.app.outputs.app_id }}" \
             --format DefaultIngress --no-header)
           echo "app_url=$app_url" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the deployed commit is this commit
+        # The guard for the whole class of bug above. Two separate deploys have
+        # now reported success while shipping something other than the commit
+        # under test -- once ignoring the spec, once ignoring the code. Both
+        # were invisible because "deployment ACTIVE" says nothing about *what*
+        # is running. This asserts it directly.
+        run: |
+          deployed=$(doctl apps get "${{ steps.app.outputs.app_id }}" -o json \
+            | jq -r '.[0].active_deployment.services[0].source_commit_hash // ""')
+          echo "expected: ${{ github.sha }}"
+          echo "deployed: ${deployed:-<none>}"
+          if [ "$deployed" != "${{ github.sha }}" ]; then
+            echo "::error::Deployed commit does not match this workflow's commit."
+            echo "::error::The rollout succeeded but shipped different code."
+            exit 1
+          fi
+          echo "Deployed commit matches."
 
       - name: Verify the deployed service is serving
         # App Platform already health-checks the container, but that only
