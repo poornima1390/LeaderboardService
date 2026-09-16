@@ -72,6 +72,13 @@ async def submit_score(
             score=score,
             achieved_at=submitted_at,
             display_name=display_name,
+            # Enqueue index work only when an index exists to receive it.
+            # `redis_client is None` means REDIS_URL was never configured, so
+            # there is nothing for a sweeper to deliver to and the rows would
+            # accumulate forever. A *configured but unreachable* Redis is the
+            # opposite case: the client is present, the ZADD below fails, and
+            # the outbox row is exactly what makes that recoverable.
+            enqueue_index_sync=redis_client is not None,
         )
     # Committed. From here on, nothing can lose this score.
 

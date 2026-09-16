@@ -286,7 +286,7 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**357 tests, 92% coverage.** 223 unit tests run with no dependencies; 134
+**360 tests, 92% coverage.** 223 unit tests run with no dependencies; 137
 integration tests run against real Postgres and Redis and skip cleanly when
 those are absent.
 
@@ -320,6 +320,11 @@ Coverage worth calling out:
   reconverges. Includes redelivering already-applied work, delivering stale
   updates last, and three sweepers running concurrently without duplicating
   work (`FOR UPDATE SKIP LOCKED`).
+- **No stranded outbox work** — a deploy with no Redis configured enqueues
+  nothing, so the table cannot grow without bound for work that has no
+  destination. A *configured but unreachable* Redis still enqueues, because
+  that case is recoverable. This one was caught by reading `/health` on the
+  live deployment, not by a test.
 - **Strict score typing** — `"100"`, `True`, `1.5` and `100.0` are all
   rejected rather than coerced. `True` is the one that matters: it is an `int`
   in Python, so lax validation would turn a caller's type error into a

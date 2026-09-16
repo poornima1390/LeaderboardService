@@ -243,9 +243,14 @@ class TestDegradedWrites:
         # Rank is reported as unknown rather than fabricated.
         assert all(s["rank"] is None for s in standings)
 
-    async def test_health_reports_degraded_and_outbox_backlog(
+    async def test_health_reports_degraded_with_no_stranded_outbox_work(
         self, degraded_api_client: httpx.AsyncClient
     ) -> None:
+        """With no index configured, nothing is enqueued, so nothing is stranded.
+
+        Reporting a permanently-rising backlog here would train an operator to
+        ignore the one metric that signals real index drift.
+        """
         await register(degraded_api_client)
         await degraded_api_client.post("/v1/scores", headers=AUTH, json=body())
 
@@ -254,8 +259,8 @@ class TestDegradedWrites:
         assert response.status_code == 200
         payload = response.json()
         assert payload["status"] == "degraded"
-        assert payload["outbox"]["pending"] == 3
-        assert payload["outbox"]["oldest_pending_age_s"] >= 0
+        assert payload["outbox"]["pending"] == 0
+        assert payload["outbox"]["oldest_pending_age_s"] is None
 
 
 class TestGameRegistry:

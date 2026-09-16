@@ -114,14 +114,60 @@ class TestWriteSucceedsWhileRedisIsDown:
         assert await pending_count(db) == 3
         assert await delivered_count(db) == 0
 
-    async def test_no_redis_configured_behaves_the_same(self, db: AsyncEngine) -> None:
-        """REDIS_URL unset is the same degraded path, reached at startup."""
+    async def test_no_redis_configured_enqueues_nothing(self, db: AsyncEngine) -> None:
+        """No index configured is a different case from an index that is down.
+
+        With REDIS_URL unset there is no destination and no sweeper running, so
+        outbox rows would never be delivered and never pruned -- the table
+        would grow forever at three rows per submission, for work that can
+        never complete. Attaching Redis later populates the index by
+        rebuilding from Postgres instead.
+        """
         await register(db)
         result = await scoring.submit_score(
             engine=db, redis_client=None, game_id="chess", user_id="p1", score=100, now=NOW
         )
 
         assert result.index_synced is False
+        assert result.results, "the score itself is still recorded"
+        assert await pending_count(db) == 0, "no unreachable work accumulated"
+
+        async with db.connect() as conn:
+            stored = await conn.scalar(
+                text("SELECT score FROM leaderboard_entries WHERE period='all_time'")
+            )
+        assert stored == 100
+
+    async def test_repeated_writes_without_an_index_do_not_grow_the_outbox(
+        self, db: AsyncEngine
+    ) -> None:
+        """The regression this guards: unbounded growth in a degraded deploy."""
+        await register(db)
+        for score in range(1, 21):
+            await scoring.submit_score(
+                engine=db,
+                redis_client=None,
+                game_id="chess",
+                user_id="p1",
+                score=score,
+                now=NOW,
+            )
+
+        async with db.connect() as conn:
+            assert await conn.scalar(text("SELECT count(*) FROM redis_outbox")) == 0
+
+    async def test_configured_but_unreachable_redis_still_enqueues(self, db: AsyncEngine) -> None:
+        """The distinction that matters: a transient outage must be recoverable."""
+        await register(db)
+        await scoring.submit_score(
+            engine=db,
+            redis_client=BrokenRedis(),  # type: ignore[arg-type]
+            game_id="chess",
+            user_id="p1",
+            score=100,
+            now=NOW,
+        )
+
         assert await pending_count(db) == 3
 
 

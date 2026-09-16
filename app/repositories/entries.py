@@ -128,6 +128,7 @@ async def submit_score(
     score: int,
     achieved_at: datetime,
     display_name: str | None = None,
+    enqueue_index_sync: bool = True,
 ) -> SubmissionOutcome:
     """Record a score across every period board and enqueue index updates.
 
@@ -144,6 +145,8 @@ async def submit_score(
         score: Already range-validated by the request schema.
         achieved_at: Server-assigned submission time; also the tiebreak input.
         display_name: Optional; backfills but never erases.
+        enqueue_index_sync: Whether to write outbox rows. False when no rank
+            index is configured at all — see the note below.
 
     Returns:
         The user's standing on every affected board, flagged with whether this
@@ -191,6 +194,18 @@ async def submit_score(
         )
 
     improved = tuple(standing for standing in standings if standing.improved)
+
+    # The outbox bridges a *transient* index outage: REDIS_URL is configured
+    # but unreachable right now. When no index is configured at all, these
+    # rows would never be delivered and never pruned (pruning only removes
+    # delivered rows), so the table would grow without bound at three rows per
+    # submission -- for work that has no destination.
+    #
+    # That case is handled differently and better: Postgres is the source of
+    # truth, so attaching Redis later populates the index by rebuilding from
+    # it rather than by replaying history.
+    if not enqueue_index_sync:
+        return SubmissionOutcome(standings=tuple(standings))
 
     outbox_ids: list[int] = []
     for standing in improved:
