@@ -19,9 +19,8 @@ service keeps serving from Postgres and reports `degraded` — it does not fail.
 > fast path. The read endpoints (`GET` leaderboard and user rank) land in
 > Phase 3 — see [Roadmap](#roadmap).
 >
-> The live service reports `degraded`, which is correct and deliberate: no
-> Redis is attached in production, so it exercises the Postgres-only write
-> path for real (see [Health](#health-and-observability)).
+> Managed Valkey 8 is attached, so the live service reports `status: "ok"` and
+> serves real `O(log N)` ranks rather than the Postgres fallback.
 
 ---
 
