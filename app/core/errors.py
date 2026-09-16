@@ -131,6 +131,25 @@ class UserNotRankedError(ServiceError):
     code = ErrorCode.USER_NOT_RANKED
 
 
+class ValidationFailedError(ServiceError):
+    """A validation failure raised by application code rather than by Pydantic.
+
+    Some rules cannot be expressed in a schema because they involve more than
+    one field — a period/bucket pair must be consistent, and a bucket must not
+    be in the future. Those are still validation errors from the client's point
+    of view, so they reuse the same code and detail shape rather than inventing
+    a second vocabulary for the same class of mistake.
+    """
+
+    code = ErrorCode.VALIDATION_ERROR
+
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        super().__init__(
+            message,
+            details=[ErrorDetail(field=field, issue="invalid", value=None)],
+        )
+
+
 class PayloadTooLargeError(ServiceError):
     code = ErrorCode.PAYLOAD_TOO_LARGE
 

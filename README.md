@@ -14,10 +14,10 @@ service keeps serving from Postgres and reports `degraded` — it does not fail.
 **Design rationale, including the tradeoffs that were rejected, is in
 [Spec.md](Spec.md).** This README covers running it.
 
-> **Status: Phase 2 (write path), deployed.** `POST /v1/scores` is live, with
-> the conditional UPSERT fan-out, the transactional outbox and the `ZADD GT`
-> fast path. The read endpoints (`GET` leaderboard and user rank) land in
-> Phase 3 — see [Roadmap](#roadmap).
+> **Status: Phase 3 (read path), deployed.** All three required operations
+> are live — submit a score, top X, and a user's rank with their surroundings —
+> served from Redis in `O(log N)` with a Postgres fallback. See
+> [Roadmap](#roadmap) for what remains.
 >
 > Managed Valkey 8 is attached, so the live service reports `status: "ok"` and
 > serves real `O(log N)` ranks rather than the Postgres fallback.
@@ -131,6 +131,7 @@ display names from Postgres in a single query → respond.
 |---|---|---|
 | **D1** | A submission keeps `max(existing, submitted)` | Idempotent and commutative, so retries and concurrent writes are safe with no idempotency keys and no row locks. Cost: no per-submission history. |
 | **D2** | Redis sorted sets for ranking, Postgres as source of truth | A single user's rank in Postgres is `COUNT(*)` of everyone better — unbounded. `ZREVRANK` is `O(log N)`. Cost: a second stateful system, mitigated by keeping Redis purely derived. |
+| | *Both* implementations ship | The rebuild path needs the Postgres queries anyway, and two independent implementations of one protocol turn cross-store consistency into a CI assertion. It has already paid for itself — see below. |
 | **D3** | Canonical order is `score DESC, user_id DESC`, `COLLATE "C"` | Both stores must agree on ties byte-for-byte. Cost: loses "earliest achiever wins" — see below. |
 | **D4** | Conditional UPSERT, then a transactional outbox to Redis | `ZADD GT` never lowers a score, making the sync idempotent *and* order-independent, so at-least-once delivery needs no consistency protocol. |
 | **D5** | A board is `(game, period, bucket)` | Weekly/daily boards are the first thing anyone asks for and retrofitting rewrites every query. Cost: a fixed 3× write fan-out. |
@@ -175,19 +176,52 @@ documented in [Spec.md §2a](Spec.md).
 | | | |
 |---|---|---|
 | `POST` | `/v1/scores` | Submit a score. `X-API-Key`. |
+| `GET` | `/v1/games/{id}/leaderboard` | Top X. Public. |
+| `GET` | `/v1/games/{id}/users/{id}/rank` | A user's rank + surroundings. Public. |
 | `GET` | `/v1/games` | List registered games. Public. |
 | `GET` | `/v1/games/{id}` | One game. Public. |
 | `POST` | `/v1/admin/games` | Register a game. `X-Admin-Key`. |
 | `POST` | `/v1/admin/leaderboards/rebuild` | Rebuild the index from Postgres. `X-Admin-Key`. |
 | `GET` | `/health` | Readiness. Public. |
 
-Phase 3 adds `GET /v1/games/{id}/leaderboard` and
-`GET /v1/games/{id}/users/{id}/rank`.
-
 `POST /v1/admin/games` is an addition to the original spec, which described a
 game registry but gave no way to populate it — without registration every
 submission would 404 and the service would be unusable. It sits behind the
 admin key, so a leaked game-server credential cannot create games.
+
+### Reading a leaderboard
+
+```bash
+curl -s 'localhost:8080/v1/games/chess/leaderboard?limit=3' | jq
+curl -s 'localhost:8080/v1/games/chess/users/player_12/rank?window=2' | jq
+```
+
+Both reads are public and both report which store answered:
+
+```json
+{
+  "game_id": "chess", "period": "all_time", "period_bucket": "ALL",
+  "total_entries": 7, "limit": 3, "offset": 0,
+  "entries": [
+    {"rank": 1, "user_id": "player_99",   "display_name": "Mio", "score": 99820, "achieved_at": "..."},
+    {"rank": 2, "user_id": "player_77",   "display_name": null,  "score": 98110, "achieved_at": "..."},
+    {"rank": 3, "user_id": "player_1204", "display_name": "Sam", "score": 98110, "achieved_at": "..."}
+  ],
+  "generated_at": "...", "source": "redis"
+}
+```
+
+Ranks 2 and 3 are tied at 98,110 and `player_77` wins — byte-wise descending,
+since `'7' > '1'` after the common prefix. Counter-intuitive on two counts (the
+shorter string and the smaller numeric suffix win), which is exactly why D3 is
+written down and asserted against a second implementation.
+
+`source` is returned for operational transparency: `postgres` means the rank
+index was cold or unreachable and the fallback served the request, so a
+degraded read is visible to the caller instead of silent.
+
+**`window=0` degenerates to "just my rank"**, so one endpoint answers both
+"where am I?" and "who is near me?".
 
 ### What makes submission safe to retry
 
@@ -234,6 +268,11 @@ the distinction a load balancer acts on:
 | up | up | `ok` | 200 | |
 | up | down / absent | `degraded` | **200** | Reads fall back to Postgres and writes still commit durably. 503 here would empty the LB pool over a cache outage. |
 | down | any | `unhealthy` | 503 | Nothing can be served or written. |
+
+Reads report `source`, and a cold read repairs itself: the request is served
+from Postgres while that board is rebuilt in the background, so the next read
+is fast again with no operator involvement. The rebuild is guarded so a hot
+cold key triggers one rebuild rather than one per request.
 
 `/health` also reports outbox lag — the number of undelivered index updates
 and the age of the oldest. That pair is the alarm for the rank index drifting
@@ -286,7 +325,7 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**380 tests, 92% coverage.** 223 unit tests run with no dependencies; 157
+**463 tests, 93% coverage.** 236 unit tests run with no dependencies; 227
 integration tests run against real Postgres and Redis and skip cleanly when
 those are absent.
 
@@ -312,6 +351,18 @@ Coverage worth calling out:
 - **TLS mode mapping** — `sslmode=require` must reach asyncpg verbatim and
   never as `ssl=True`; regression coverage for the bug that broke the first
   deploy.
+- **Ranking equivalence (D2)** — `RedisRanking` and `PostgresRanking` must
+  return *identical* results for `size`, `top` (across seven limit/offset
+  combinations) and `around` (across four window sizes, for every user on a
+  fully-tied board), plus 15 seeded random boards. **This caught a real bug:**
+  at rank 1 with `window=2`, Redis clamps `start` to 0 but keeps
+  `stop = rank + window`, so a clamped window returns *fewer* rows. The
+  Postgres version took a fixed `2*window + 1` rows and silently extended the
+  window downwards to compensate — four entries below instead of two. Nothing
+  short of comparing the two implementations would have found it.
+- **Cold-index fallback** — flushing Redis must never produce a silently empty
+  leaderboard. A `200` with an empty list is the worst failure this service
+  can have, because nothing about it looks like a failure.
 - **Concurrency** — 50 racing submissions of shuffled scores converge on the
   maximum, and improvements are never double-counted between the entry table
   and the outbox.
@@ -420,8 +471,8 @@ were using different TLS settings against the same database. Both now share
 | **0** | Config, logging, error envelope, `/health`, Docker, CI | ✅ done |
 | **1** | Models, migrations, period bucketing, ranking-agreement proof | ✅ done |
 | **2** | `POST /v1/scores`: UPSERT fan-out, outbox, `ZADD GT` (D1/D4) | ✅ done |
-| **3** | `RankingRepository`: Redis Lua + Postgres fallback, both read endpoints (D2/D3) | next |
-| **4** | Failure-mode tests, admin rebuild, Redis attached in production | |
+| **3** | `RankingRepository`: Redis Lua + Postgres fallback, both read endpoints (D2/D3) | ✅ done |
+| **4** | Admin rebuild ✅, Valkey in production ✅ — remaining: rate limiting, live updates | |
 
 Explicitly out of scope, with reasoning, in [Spec.md §9](Spec.md) — including
 per-user auth, rate limiting, anti-cheat and local-time period boundaries.
@@ -443,6 +494,10 @@ app/
   domain/periods.py      Period, BoardKey, UTC bucketing, D5 fan-out
   domain/identifiers.py  id patterns and score bounds, shared by API + schema
   models/entities.py     the four tables; COLLATE "C" lives here
+  api/v1/leaderboards.py      top X and user-rank endpoints
+  repositories/ranking.py          the RankingRepository protocol (D2)
+  repositories/redis_ranking.py    fast path; Lua for atomic windowed reads
+  repositories/postgres_ranking.py fallback, rebuild oracle, test reference
   repositories/entries.py     the conditional UPSERT fan-out (D1)
   repositories/rank_index.py  ZADD GT writer, TTL policy (D4)
   repositories/outbox.py      claim/settle/prune, FOR UPDATE SKIP LOCKED

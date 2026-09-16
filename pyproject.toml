@@ -38,6 +38,17 @@ known-first-party = ["app", "tests"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S105", "S106"]  # hardcoded test credentials are fine
 
+# S608 (SQL built by string construction) is a false positive here. The only
+# interpolated values are the module-level constants _BOARD_FILTER and
+# _ORDER_BY; every caller-supplied value is a bound parameter.
+#
+# Those constants are deliberate rather than incidental: _ORDER_BY is the
+# canonical ranking order (Spec.md D3), and it is shared across four queries
+# precisely so it cannot drift between them. Inlining it to satisfy the lint
+# would duplicate the one clause in this codebase that must stay identical
+# everywhere, which trades a real correctness guarantee for a cosmetic one.
+"app/repositories/postgres_ranking.py" = ["S608"]
+
 # ---------------------------------------------------------------------------
 # mypy — strict. The service is small enough that there is no excuse not to be.
 # ---------------------------------------------------------------------------
