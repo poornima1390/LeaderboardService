@@ -286,7 +286,7 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**360 tests, 92% coverage.** 223 unit tests run with no dependencies; 137
+**359 tests, 92% coverage.** 223 unit tests run with no dependencies; 136
 integration tests run against real Postgres and Redis and skip cleanly when
 those are absent.
 
