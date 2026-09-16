@@ -20,6 +20,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.core.config import get_settings
+from app.core.db import asyncpg_connect_args
 from app.models import Base
 
 config = context.config
@@ -29,7 +30,8 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+settings = get_settings()
+config.set_main_option("sqlalchemy.url", settings.database_url)
 
 
 def run_migrations_offline() -> None:
@@ -69,6 +71,10 @@ async def run_async_migrations() -> None:
         # NullPool: a migration job is a short-lived process, so pooling adds
         # nothing and a lingering pool delays exit.
         poolclass=pool.NullPool,
+        # The same TLS and driver settings the application uses. Without this
+        # the two negotiated TLS differently, and migrations succeeded against
+        # a database the service itself could not connect to.
+        connect_args=asyncpg_connect_args(settings),
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

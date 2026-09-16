@@ -1,17 +1,25 @@
 # DigitalOcean App Platform specification.
 #
 # Applied by scripts/deploy_do.sh, which substitutes the ${...} placeholders
-# from the environment so that no secret is ever committed to this repository.
+# from the environment so no secret is ever committed to this repository.
 #
-#   doctl apps create  --spec <(envsubst < .do/app.yaml)     # first deploy
-#   doctl apps update <id> --spec <(envsubst < .do/app.yaml)  # subsequent
+# Source is a plain `git` clone rather than a `github` integration, for two
+# reasons:
+#
+#   1. A `github` source requires the DigitalOcean GitHub App to be authorised
+#      interactively in the dashboard. A `git` source needs only an API token,
+#      so the whole deploy is scriptable and reproducible from a clean machine.
+#   2. `github.deploy_on_push` would deploy on every push to main *regardless
+#      of whether CI passed*. Deployments are instead triggered by the `deploy`
+#      job in .github/workflows/ci.yml, which runs only after lint, types,
+#      tests and the image build have all gone green. CI is the gate.
 name: leaderboard-service
 region: nyc
 
 databases:
   # A dev database, not a production cluster: this is an exercise deployment
-  # and the cost difference is ~$7/mo versus ~$60/mo. The app is indifferent —
-  # it receives a standard DATABASE_URL either way.
+  # and the difference is ~$7/mo against ~$60/mo. The application is
+  # indifferent — it receives a standard DATABASE_URL either way.
   - name: leaderboard-db
     engine: PG
     version: "17"
@@ -19,39 +27,38 @@ databases:
 
   # NOTE: Redis is deliberately absent.
   #
-  # The rank index is derived state, and the service is designed to serve
-  # correctly without it — reads fall back to Postgres and /health reports
-  # "degraded" (Spec.md D2, §4). DigitalOcean has no free managed Valkey/Redis
-  # tier, so Phase 0 deploys without one and exercises the degraded path for
-  # real rather than pretending it works. To add it:
+  # The rank index is derived state, and the service is built to serve
+  # correctly without it: reads fall back to Postgres and /health reports
+  # "degraded" rather than failing (Spec.md D2, §4). DigitalOcean has no dev
+  # tier for managed Valkey/Redis, so attaching one costs ~$15/mo for a
+  # capability Phases 2-3 have not started using yet. Deploying without it
+  # exercises the degraded path for real instead of assuming it works.
   #
+  # To add it later:
   #   - name: leaderboard-cache
   #     engine: VALKEY
   #     version: "8"
-  #     production: true       # no dev tier exists for Valkey
-  #
-  # ...then set REDIS_URL to ${leaderboard-cache.DATABASE_URL} below.
+  #     production: true
+  # ...then set REDIS_URL to ${leaderboard-cache.DATABASE_URL} on both the
+  # service and the migrate job.
 
 services:
   - name: api
     dockerfile_path: Dockerfile
     http_port: 8080
 
-    github:
-      repo: ${GITHUB_REPO}
+    git:
+      repo_clone_url: https://github.com/${GITHUB_REPO}.git
       branch: main
-      # Redeploy on every push to main. CI gates merges, so main is the
-      # release branch.
-      deploy_on_push: true
 
     instance_count: 1
     instance_size_slug: apps-s-1vcpu-0.5gb
 
     health_check:
       http_path: /health
-      # Generous initial delay: the container must boot Python and build the
-      # connection pools before it can answer. Too tight a delay here shows up
-      # as a deploy that flaps rather than fails.
+      # Generous initial delay: the container boots Python and builds
+      # connection pools before it can answer. Too tight a value here shows up
+      # as a deploy that flaps rather than one that fails cleanly.
       initial_delay_seconds: 20
       period_seconds: 15
       timeout_seconds: 5
@@ -68,8 +75,9 @@ services:
         value: INFO
 
       # Bound from the attached database. DigitalOcean supplies a
-      # `postgresql://...?sslmode=require` URL; app.core.config rewrites the
-      # scheme for asyncpg and moves sslmode into connect_args.
+      # postgresql://...?sslmode=require URL; app.core.config rewrites the
+      # scheme for asyncpg and moves sslmode into connect_args, because the
+      # asyncpg dialect rejects the parameter outright.
       - key: DATABASE_URL
         scope: RUN_AND_BUILD_TIME
         value: ${leaderboard-db.DATABASE_URL}
@@ -85,17 +93,16 @@ services:
         value: ${LB_ADMIN_API_KEY}
 
 jobs:
-  # Migrations run here, as a PRE_DEPLOY job, and never at app startup.
+  # Migrations run here, as a PRE_DEPLOY job, and never at application startup.
   # App Platform runs this once per deploy before any new instance takes
-  # traffic, which is exactly the guarantee needed: concurrent instances racing
+  # traffic — exactly the guarantee needed, since concurrent instances racing
   # to migrate on boot is a reliable way to corrupt a deploy (Spec.md §8).
   - name: migrate
     kind: PRE_DEPLOY
     dockerfile_path: Dockerfile
-    github:
-      repo: ${GITHUB_REPO}
+    git:
+      repo_clone_url: https://github.com/${GITHUB_REPO}.git
       branch: main
-      deploy_on_push: true
     instance_count: 1
     instance_size_slug: apps-s-1vcpu-0.5gb
     run_command: alembic upgrade head
@@ -106,7 +113,7 @@ jobs:
       - key: DATABASE_URL
         scope: RUN_AND_BUILD_TIME
         value: ${leaderboard-db.DATABASE_URL}
-      # The migration job loads the same Settings object as the app, which
+      # The migration job loads the same Settings object as the service, which
       # requires these to be present and non-placeholder even though a
       # migration never uses them.
       - key: API_KEY

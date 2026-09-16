@@ -21,14 +21,31 @@ logger = get_logger(__name__)
 SessionFactory = async_sessionmaker[Any]
 
 
-def create_engine(settings: Settings) -> AsyncEngine:
-    """Build the async Postgres engine.
+def asyncpg_connect_args(settings: Settings) -> dict[str, Any]:
+    """Driver arguments that cannot be expressed in the URL.
 
-    ``connect_args`` carries the two things the asyncpg dialect needs that
-    cannot live in the URL:
+    Shared by the application engine and by Alembic (migrations/env.py), so
+    the two negotiate TLS identically. They previously did not, and the
+    difference hid a real failure: migrations connected successfully while the
+    service could not, because only one of them set an ``ssl`` argument.
 
-    * ``ssl`` — the dialect rejects libpq's ``sslmode`` query parameter, so
-      config strips it from the URL and it is re-applied here.
+    * ``ssl`` — the asyncpg *dialect* rejects libpq's ``sslmode`` query
+      parameter, so config strips it from the URL and it is re-applied here.
+      The value is passed through as the libpq mode string rather than as a
+      boolean: asyncpg understands 'disable', 'allow', 'prefer', 'require',
+      'verify-ca' and 'verify-full' with libpq's exact semantics.
+
+      This distinction is not cosmetic. ``ssl=True`` means *encrypt and fully
+      verify the certificate* (equivalent to verify-full), whereas
+      ``sslmode=require`` — what DigitalOcean's connection string actually
+      asks for — means *encrypt without verifying*. Mapping require to True
+      silently raises the requirement and fails with
+      SSLCertVerificationError, because the provider's CA is not in the
+      container's trust store.
+
+      Upgrading to verify-full is the right end state, but it needs the
+      provider CA bundle shipped in the image and pinned; until then we honour
+      exactly what the connection string requests.
     * ``statement_cache_size`` — must be 0 behind a transaction-mode pooler,
       where a prepared statement can be handed a different backend connection
       than the one that prepared it (Spec.md §8).
@@ -38,13 +55,15 @@ def create_engine(settings: Settings) -> AsyncEngine:
         "timeout": 10,
     }
     if settings.db_ssl_mode is not None:
-        # asyncpg takes ssl=True for "encrypt, and verify if we can", which is
-        # what sslmode=require/verify-* all reduce to at this layer.
-        connect_args["ssl"] = True
+        connect_args["ssl"] = settings.db_ssl_mode
+    return connect_args
 
+
+def create_engine(settings: Settings) -> AsyncEngine:
+    """Build the async Postgres engine."""
     return create_async_engine(
         settings.database_url,
-        connect_args=connect_args,
+        connect_args=asyncpg_connect_args(settings),
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         # Managed Postgres and pgbouncer both drop idle connections; recycling
