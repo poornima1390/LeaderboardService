@@ -349,12 +349,20 @@ Coverage worth calling out:
 **Deployment is driven by CI, not by App Platform's `deploy_on_push`.** That
 distinction is the point: `deploy_on_push` reacts to the push itself, so a
 commit failing lint or tests would still ship. The deploy job `needs` all three
-gates, so a red build genuinely means "not deployed". It resolves the app by
-name, creates a deployment with `--wait`, then independently curls the public
-ingress — App Platform's own health check only proves the rollout believed
-itself healthy, not that the URL answers. Deploys use a non-cancelling
-concurrency group, because interrupting a rollout half-done is worse than
-deploying a minute later.
+gates, so a red build genuinely means "not deployed".
+
+**The deploy applies `.do/app.yaml`, not just the code.** It renders the spec
+from GitHub secrets and runs `doctl apps update --spec`, so infrastructure
+changes ship with the commit that makes them. The earlier version called
+`doctl apps create-deployment`, which redeploys using the app's *server-side
+stored* spec — so the commit attaching Valkey deployed green and changed
+nothing at all. That made `.do/app.yaml` decorative and free to drift from
+reality, which is the worst possible state for an infrastructure file.
+
+It then independently curls the public ingress, because App Platform's own
+health check only proves the rollout believed itself healthy, not that the URL
+answers. Deploys use a non-cancelling concurrency group, since interrupting a
+rollout half-done is worse than deploying a minute later.
 
 ### First-time setup
 
@@ -362,7 +370,12 @@ deploying a minute later.
 export LB_API_KEY=$(openssl rand -hex 32)
 export LB_ADMIN_API_KEY=$(openssl rand -hex 32)
 ./scripts/deploy_do.sh          # creates the app; idempotent, safe to re-run
-gh secret set DIGITALOCEAN_ACCESS_TOKEN   # lets CI deploy thereafter
+
+# CI needs all three to apply the spec on later deploys. Without the key
+# secrets the deploy job refuses to run rather than blanking the live keys.
+gh secret set DIGITALOCEAN_ACCESS_TOKEN
+gh secret set LB_API_KEY
+gh secret set LB_ADMIN_API_KEY
 ```
 
 The script renders [.do/app.yaml](.do/app.yaml), substituting only our own

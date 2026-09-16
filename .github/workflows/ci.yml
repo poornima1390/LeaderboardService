@@ -207,6 +207,9 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
+      - name: Install envsubst
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gettext-base
+
       - name: Resolve app id
         id: app
         # Looked up by name rather than stored as a secret or hardcoded: the
@@ -223,17 +226,59 @@ jobs:
           echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
           echo "Resolved app id: $app_id"
 
+      - name: Render the app spec
+        # `.do/app.yaml` is the source of truth for infrastructure, so it is
+        # applied on every deploy rather than only at creation.
+        #
+        # This exists because of a real failure: the job used to call
+        # `doctl apps create-deployment`, which redeploys using the app's
+        # *server-side stored* spec. A commit that attached a Valkey cluster in
+        # .do/app.yaml therefore deployed successfully and silently changed
+        # nothing — the spec file was decorative and free to drift from
+        # reality.
+        #
+        # An explicit variable list, so App Platform's own bindings such as
+        # ${leaderboard-cache.DATABASE_URL} pass through untouched instead of
+        # being substituted to an empty string.
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          LB_API_KEY: ${{ secrets.LB_API_KEY }}
+          LB_ADMIN_API_KEY: ${{ secrets.LB_ADMIN_API_KEY }}
+        run: |
+          if [ -z "$LB_API_KEY" ] || [ -z "$LB_ADMIN_API_KEY" ]; then
+            echo "::error::LB_API_KEY / LB_ADMIN_API_KEY secrets are not set."
+            echo "::error::Applying the spec without them would blank the"
+            echo "::error::service's API keys. Refusing to deploy."
+            exit 1
+          fi
+          envsubst '$GITHUB_REPO $LB_API_KEY $LB_ADMIN_API_KEY' \
+            < .do/app.yaml > /tmp/app-spec.yaml
+
+          # A placeholder left unsubstituted would silently destroy a binding.
+          if grep -q 'leaderboard-db.DATABASE_URL' /tmp/app-spec.yaml; then
+            echo "Database binding preserved."
+          else
+            echo "::error::Database binding was clobbered during substitution."
+            exit 1
+          fi
+          doctl apps spec validate /tmp/app-spec.yaml > /dev/null
+          echo "Spec validated."
+
       - name: Deploy
         id: deploy
-        # The app spec pins the source to the main branch, so creating a
-        # deployment rebuilds from the commit this workflow is running for.
-        # --wait blocks until the rollout is ACTIVE or has failed, which is
-        # what makes a red build mean "not deployed".
+        # `apps update --spec` applies any infrastructure change AND triggers a
+        # deployment from the branch the spec pins, so one command keeps the
+        # running app and the committed spec in step. --wait blocks until the
+        # rollout is ACTIVE or has failed, which is what makes a red build mean
+        # "not deployed".
         run: |
           set -o pipefail
-          doctl apps create-deployment "${{ steps.app.outputs.app_id }}" --wait \
-            --format ID,Phase --no-header | tee /tmp/deploy.txt
-          phase=$(awk '{print $2}' /tmp/deploy.txt | tail -1)
+          doctl apps update "${{ steps.app.outputs.app_id }}" \
+            --spec /tmp/app-spec.yaml --wait --format ID,Spec.Name --no-header \
+            | tee /tmp/deploy.txt
+
+          phase=$(doctl apps list-deployments "${{ steps.app.outputs.app_id }}" \
+            --format Phase --no-header | head -1)
           if [ "$phase" != "ACTIVE" ]; then
             echo "::error::Deployment finished in phase $phase"
             exit 1
