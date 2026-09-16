@@ -7,18 +7,22 @@ now so the versioned prefix and the OpenAPI grouping are fixed from the start.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
 from app import __version__
 from app.api.health import router as health_router
+from app.api.v1 import router as v1_router
 from app.core.config import Settings, get_settings
-from app.core.db import create_engine, create_redis, create_session_factory
+from app.core.db import create_engine, create_redis
 from app.core.errors import ErrorEnvelope, install_error_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import install_middleware
+from app.repositories import rank_index
+from app.services.outbox_sweeper import run_sweeper
 
 logger = get_logger(__name__)
 
@@ -50,7 +54,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
 
     app.state.engine = create_engine(settings)
-    app.state.session_factory = create_session_factory(app.state.engine)
     app.state.redis = create_redis(settings)
 
     logger.info(
@@ -60,16 +63,56 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         redis_enabled=settings.redis_enabled,
     )
 
+    # The outbox sweeper is what converges the rank index after a Redis
+    # outage. It exits on its own when Redis is not configured.
+    sweeper = asyncio.create_task(
+        run_sweeper(
+            app.state.engine,
+            app.state.redis,
+            interval_s=settings.outbox_sweep_interval_s,
+        ),
+        name="outbox-sweeper",
+    )
+    app.state.sweeper = sweeper
+
+    # ZADD GT (Redis >= 6.2) is load-bearing: it is what makes outbox delivery
+    # idempotent and order-independent. On an older server every write would
+    # silently become an unconditional ZADD, and a stale retry could *lower* a
+    # live standing. Checked once, in the background so a slow or unreachable
+    # Redis cannot delay startup.
+    if app.state.redis is not None:
+        app.state.gt_check = asyncio.create_task(
+            _warn_if_no_gt(app.state.redis), name="redis-gt-check"
+        )
+
     # Startup does not verify connectivity on purpose: a dependency that is
     # briefly unavailable should leave the instance booting and reporting
     # unhealthy via /health, not crash-looping the container.
     try:
         yield
     finally:
+        sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper
         if app.state.redis is not None:
             await app.state.redis.aclose()
         await app.state.engine.dispose()
         logger.info("service.shutdown")
+
+
+async def _warn_if_no_gt(redis_client: object) -> None:
+    """Log loudly if the Redis server predates ZADD GT."""
+    from redis.asyncio import Redis
+
+    assert isinstance(redis_client, Redis)
+    if not await rank_index.supports_gt(redis_client):
+        logger.error(
+            "redis.zadd_gt_unsupported",
+            detail=(
+                "Redis >= 6.2 is required. Without ZADD GT, a retried or "
+                "out-of-order outbox delivery can lower a standing."
+            ),
+        )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -107,6 +150,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_error_handlers(app)
 
     app.include_router(health_router)
+    app.include_router(v1_router, prefix=API_V1_PREFIX)
 
     return app
 

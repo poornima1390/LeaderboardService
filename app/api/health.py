@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app import __version__
 from app.core.logging import get_logger
+from app.repositories import outbox
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["ops"])
@@ -50,10 +51,27 @@ class DependencyCheck(BaseModel):
     )
 
 
+class OutboxLag(BaseModel):
+    """How far the rank index is behind Postgres (Spec.md D4, §8).
+
+    The pair worth alerting on: a rising count means the index is falling
+    behind, and a rising oldest-age means something is stuck rather than
+    merely busy. Reported but deliberately NOT part of the status verdict —
+    a backlog means stale ranks, not an inability to serve, and pulling the
+    instance out of the pool would only slow the drain.
+    """
+
+    pending: int = Field(description="Undelivered index updates.")
+    oldest_pending_age_s: float | None = Field(
+        default=None, description="Age of the oldest undelivered update, in seconds."
+    )
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded", "unhealthy"]
     version: str
     checks: dict[str, DependencyCheck]
+    outbox: OutboxLag | None = None
 
 
 async def probe_postgres(engine: AsyncEngine | None) -> DependencyCheck:
@@ -132,8 +150,26 @@ async def health(request: Request, response: Response) -> HealthResponse:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         response.headers["Retry-After"] = "5"
 
+    # Only meaningful when Postgres answered; skipped otherwise so an
+    # unhealthy response is not delayed by a second doomed query.
+    outbox_lag: OutboxLag | None = None
+    if postgres_check.status is CheckStatus.UP and engine is not None:
+        outbox_lag = await _probe_outbox(engine)
+
     return HealthResponse(
         status=overall,
         version=__version__,
         checks={"postgres": postgres_check, "redis": redis_check},
+        outbox=outbox_lag,
     )
+
+
+async def _probe_outbox(engine: AsyncEngine) -> OutboxLag | None:
+    """Read the outbox backlog. Never affects the health verdict."""
+    try:
+        async with asyncio.timeout(PROBE_TIMEOUT_S), engine.connect() as conn:
+            pending, oldest_age = await outbox.pending_stats(conn)
+    except Exception as exc:
+        logger.warning("health.outbox_probe_failed", error_type=type(exc).__name__)
+        return None
+    return OutboxLag(pending=pending, oldest_pending_age_s=oldest_age)

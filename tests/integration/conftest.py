@@ -15,6 +15,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 
+import httpx
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
@@ -22,6 +23,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.core.config import Settings
+from app.main import create_app
 from app.models import Base
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -111,3 +114,63 @@ async def redis_client() -> AsyncIterator[Redis]:
     finally:
         await client.flushdb()
         await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures for tests that need *committed* data
+#
+# The `pg` fixture above rolls back, which gives perfect isolation but makes
+# concurrency untestable: two transactions racing for the same row must both
+# be able to commit. These fixtures commit for real and clean up afterwards.
+# --------------------------------------------------------------------------- #
+
+TRUNCATE_ALL = text(
+    "TRUNCATE leaderboard_entries, redis_outbox, users, games RESTART IDENTITY CASCADE"
+)
+
+
+@pytest_asyncio.fixture
+async def db(schema_ready: bool) -> AsyncIterator[AsyncEngine]:
+    """An engine against an empty database, truncated before and after."""
+    if not schema_ready:
+        pytest.skip(f"Postgres unreachable at {DATABASE_URL.rsplit('@', 1)[-1]}")
+
+    engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
+    async with engine.begin() as conn:
+        await conn.execute(TRUNCATE_ALL)
+    try:
+        yield engine
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(TRUNCATE_ALL)
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def api_client(db: AsyncEngine, redis_client: Redis) -> AsyncIterator[httpx.AsyncClient]:
+    """The real app, wired to real stores.
+
+    Lifespan is not run, so the background outbox sweeper does not start.
+    That is deliberate: a sweeper draining rows concurrently would make
+    assertions about the pending backlog racy, and the sweeper has its own
+    dedicated tests.
+    """
+    app = create_app(Settings())
+    app.state.engine = db
+    app.state.redis = redis_client
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def degraded_api_client(db: AsyncEngine) -> AsyncIterator[httpx.AsyncClient]:
+    """The app with NO rank index, exercising the degraded write path."""
+    app = create_app(Settings())
+    app.state.engine = db
+    app.state.redis = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client

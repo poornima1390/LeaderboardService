@@ -14,16 +14,14 @@ service keeps serving from Postgres and reports `degraded` — it does not fail.
 **Design rationale, including the tradeoffs that were rejected, is in
 [Spec.md](Spec.md).** This README covers running it.
 
-> **Status: Phase 1 (data layer), deployed.** Configuration, logging, the
-> error envelope, readiness, container, CI and continuous deployment are
-> complete. The schema, migrations and period bucketing are in place, and the
-> Postgres/Redis ranking agreement the whole design rests on is verified
-> against both real engines. The `/v1` endpoints land in Phases 2–3 — see
-> [Roadmap](#roadmap).
+> **Status: Phase 2 (write path), deployed.** `POST /v1/scores` is live, with
+> the conditional UPSERT fan-out, the transactional outbox and the `ZADD GT`
+> fast path. The read endpoints (`GET` leaderboard and user rank) land in
+> Phase 3 — see [Roadmap](#roadmap).
 >
-> The live service currently reports `degraded`, which is correct and
-> deliberate: no Redis is attached, so rank queries would use the Postgres
-> fallback (see [Health](#health-and-observability)).
+> The live service reports `degraded`, which is correct and deliberate: no
+> Redis is attached in production, so it exercises the Postgres-only write
+> path for real (see [Health](#health-and-observability)).
 
 ---
 
@@ -39,6 +37,37 @@ curl -s localhost:8080/health | jq
 ```
 
 Interactive API docs: <http://localhost:8080/docs>
+
+### Submit a score
+
+```bash
+# Register a game once (admin key), then submit scores.
+curl -s localhost:8080/v1/admin/games \
+  -H 'X-Admin-Key: local-dev-admin-key-not-for-production' \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"chess","name":"Chess"}'
+
+curl -s localhost:8080/v1/scores \
+  -H 'X-API-Key: local-dev-api-key-not-for-production' \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"player_4417","game_id":"chess","score":18500,"display_name":"Ayo"}' | jq
+```
+
+```json
+{
+  "user_id": "player_4417", "game_id": "chess",
+  "submitted_score": 18500, "submitted_at": "2026-09-16T19:04:02.355398Z",
+  "standings": [
+    {"period": "all_time", "period_bucket": "ALL",        "score": 18500, "rank": 1, "improved": true},
+    {"period": "daily",    "period_bucket": "2026-09-16", "score": 18500, "rank": 1, "improved": true},
+    {"period": "weekly",   "period_bucket": "2026-W38",   "score": 18500, "rank": 1, "improved": true}
+  ]
+}
+```
+
+One submission updates three boards, and `improved` is reported per board —
+submitting 9000 next returns `improved: false` everywhere with `score` still
+18500, because a standing is your *best* score.
 
 ### Without Docker
 
@@ -142,6 +171,43 @@ documented in [Spec.md §2a](Spec.md).
 
 ---
 
+## Endpoints
+
+| | | |
+|---|---|---|
+| `POST` | `/v1/scores` | Submit a score. `X-API-Key`. |
+| `GET` | `/v1/games` | List registered games. Public. |
+| `GET` | `/v1/games/{id}` | One game. Public. |
+| `POST` | `/v1/admin/games` | Register a game. `X-Admin-Key`. |
+| `GET` | `/health` | Readiness. Public. |
+
+Phase 3 adds `GET /v1/games/{id}/leaderboard` and
+`GET /v1/games/{id}/users/{id}/rank`.
+
+`POST /v1/admin/games` is an addition to the original spec, which described a
+game registry but gave no way to populate it — without registration every
+submission would 404 and the service would be unusable. It sits behind the
+admin key, so a leaked game-server credential cannot create games.
+
+### What makes submission safe to retry
+
+A standing is `max(existing, submitted)`, so the write is idempotent *and*
+commutative. In practice that means:
+
+- **Retry freely.** No idempotency key, no dedupe table. A replayed request
+  returns the same body with `improved: false`.
+- **No lost updates.** One SQL statement per submission, with max-semantics
+  enforced by `WHERE EXCLUDED.score > leaderboard_entries.score` on the
+  `DO UPDATE`. There is no read-modify-write window in application code and no
+  lock held across a round trip. Verified with 50 concurrent submissions of
+  shuffled scores converging on the maximum.
+- **A Redis outage costs staleness, not data.** The outbox row commits in the
+  same transaction as the score, so the write cannot be lost; delivery uses
+  `ZADD GT`, which raises a member's score but never lowers it. That makes
+  delivery idempotent *and* order-independent, so at-least-once retry needs no
+  consistency protocol — verified by forcing stale updates to deliver last and
+  confirming the index still converges on the true best.
+
 ## Configuration
 
 Every setting comes from the environment. **The service refuses to start** if a
@@ -168,6 +234,12 @@ the distinction a load balancer acts on:
 | up | up | `ok` | 200 | |
 | up | down / absent | `degraded` | **200** | Reads fall back to Postgres and writes still commit durably. 503 here would empty the LB pool over a cache outage. |
 | down | any | `unhealthy` | 503 | Nothing can be served or written. |
+
+`/health` also reports outbox lag — the number of undelivered index updates
+and the age of the oldest. That pair is the alarm for the rank index drifting
+away from Postgres. It is reported but deliberately excluded from the status
+verdict: a backlog means stale ranks, not an inability to serve, and pulling
+the instance from the pool would only slow the drain.
 
 Logs are JSON lines, one access line per request, with `request_id` bound to
 every line emitted during that request. The same id is returned in the
@@ -214,7 +286,7 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**203 tests, 92% coverage.** 144 unit tests run with no dependencies; 59
+**357 tests, 92% coverage.** 223 unit tests run with no dependencies; 134
 integration tests run against real Postgres and Redis and skip cleanly when
 those are absent.
 
@@ -240,6 +312,18 @@ Coverage worth calling out:
 - **TLS mode mapping** — `sslmode=require` must reach asyncpg verbatim and
   never as `ssl=True`; regression coverage for the bug that broke the first
   deploy.
+- **Concurrency** — 50 racing submissions of shuffled scores converge on the
+  maximum, and improvements are never double-counted between the entry table
+  and the outbox.
+- **Redis-outage recovery** — the full cycle: writes succeed while Redis is
+  down, the backlog is retained, the sweeper drains it, and the index
+  reconverges. Includes redelivering already-applied work, delivering stale
+  updates last, and three sweepers running concurrently without duplicating
+  work (`FOR UPDATE SKIP LOCKED`).
+- **Strict score typing** — `"100"`, `True`, `1.5` and `100.0` are all
+  rejected rather than coerced. `True` is the one that matters: it is an `int`
+  in Python, so lax validation would turn a caller's type error into a
+  legitimate score of 1.
 
 ---
 
@@ -317,8 +401,8 @@ were using different TLS settings against the same database. Both now share
 |---|---|---|
 | **0** | Config, logging, error envelope, `/health`, Docker, CI | ✅ done |
 | **1** | Models, migrations, period bucketing, ranking-agreement proof | ✅ done |
-| **2** | `POST /v1/scores`: UPSERT fan-out, outbox, `ZADD GT` (D1/D4) | next |
-| **3** | `RankingRepository`: Redis Lua + Postgres fallback, both read endpoints (D2/D3) | |
+| **2** | `POST /v1/scores`: UPSERT fan-out, outbox, `ZADD GT` (D1/D4) | ✅ done |
+| **3** | `RankingRepository`: Redis Lua + Postgres fallback, both read endpoints (D2/D3) | next |
 | **4** | Failure-mode tests, admin rebuild, Redis attached in production | |
 
 Explicitly out of scope, with reasoning, in [Spec.md §9](Spec.md) — including
@@ -335,9 +419,18 @@ app/
   core/logging.py        structlog over the stdlib bridge
   core/middleware.py     request ids, access log, body size limit
   core/db.py             engine and Redis client lifecycle
+  api/deps.py            API-key auth, constant-time comparison
+  api/v1/scores.py       POST /v1/scores
+  api/v1/games.py        game registry
   domain/periods.py      Period, BoardKey, UTC bucketing, D5 fan-out
   domain/identifiers.py  id patterns and score bounds, shared by API + schema
   models/entities.py     the four tables; COLLATE "C" lives here
+  repositories/entries.py     the conditional UPSERT fan-out (D1)
+  repositories/rank_index.py  ZADD GT writer, TTL policy (D4)
+  repositories/outbox.py      claim/settle/prune, FOR UPDATE SKIP LOCKED
+  services/scoring.py         orchestration: commit, then best-effort index
+  services/outbox_sweeper.py  background convergence after an outage
+  schemas/               request/response models, strict validation
 migrations/              Alembic; URL comes from app settings
 tests/unit/              no live dependencies needed
 tests/integration/       real Postgres + Redis; skipped when absent

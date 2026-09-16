@@ -1,5 +1,11 @@
 """Backing store lifecycle: the Postgres engine and the Redis client.
 
+No ORM session factory is exposed. The models exist to define the schema and
+drive migrations, but every query in app/repositories is hand-written Core SQL
+on a connection — the ranking queries have to align exactly with a specific
+index and ordering (Spec.md D3), and an ORM layer would obscure the one thing
+about them that must not drift.
+
 Postgres is the system of record; Redis is a derived, rebuildable rank index
 (Spec.md D2). That asymmetry is enforced here: the engine is required for the
 service to function, while the Redis client is optional and its absence is a
@@ -11,14 +17,12 @@ from __future__ import annotations
 from typing import Any
 
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.core.config import Settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
-
-SessionFactory = async_sessionmaker[Any]
 
 
 def asyncpg_connect_args(settings: Settings) -> dict[str, Any]:
@@ -72,10 +76,6 @@ def create_engine(settings: Settings) -> AsyncEngine:
         pool_pre_ping=True,
         echo=False,
     )
-
-
-def create_session_factory(engine: AsyncEngine) -> SessionFactory:
-    return async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 
 
 def create_redis(settings: Settings) -> Redis | None:
