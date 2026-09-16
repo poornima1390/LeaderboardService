@@ -9,6 +9,7 @@ without locks held across the network.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -241,3 +242,80 @@ async def read_standing(
     )
     row = result.first()
     return int(row[0]) if row else None
+
+
+@dataclass(frozen=True, slots=True)
+class BoardRow:
+    """One ranked standing, as read back for an index rebuild."""
+
+    game_id: str
+    period: Period
+    bucket: str
+    user_id: str
+    score: int
+
+
+async def list_boards(
+    conn: AsyncConnection, *, game_id: str | None = None, period: Period | None = None
+) -> list[tuple[str, Period, str]]:
+    """Every board that currently holds at least one standing.
+
+    Read from the entries table rather than derived from today's date, so a
+    rebuild also restores historical daily and weekly boards.
+    """
+    clauses = []
+    params: dict[str, object] = {}
+    if game_id is not None:
+        clauses.append("game_id = :game_id")
+        params["game_id"] = game_id
+    if period is not None:
+        clauses.append("period = :period")
+        params["period"] = period.value
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    result = await conn.execute(
+        text(
+            f"SELECT DISTINCT game_id, period, period_bucket "  # noqa: S608
+            f"FROM leaderboard_entries {where} "
+            "ORDER BY game_id, period, period_bucket"
+        ),
+        params,
+    )
+    return [(row[0], Period(row[1]), row[2]) for row in result]
+
+
+async def stream_board(
+    conn: AsyncConnection,
+    *,
+    game_id: str,
+    period: Period,
+    bucket: str,
+    batch_size: int = 1000,
+) -> AsyncIterator[list[BoardRow]]:
+    """Yield a board's standings in batches, in canonical order.
+
+    Uses a server-side cursor so memory stays bounded regardless of board
+    size — a rebuild must not require holding an entire leaderboard in the
+    process.
+    """
+    query = (
+        text(
+            "SELECT user_id, score FROM leaderboard_entries "
+            "WHERE game_id = :game_id AND period = :period AND period_bucket = :bucket "
+            "ORDER BY score DESC, user_id DESC"
+        )
+        .bindparams(game_id=game_id, period=period.value, bucket=bucket)
+        .execution_options(yield_per=batch_size)
+    )
+    result = await conn.stream(query)
+    async for partition in result.partitions(batch_size):
+        yield [
+            BoardRow(
+                game_id=game_id,
+                period=period,
+                bucket=bucket,
+                user_id=row[0],
+                score=row[1],
+            )
+            for row in partition
+        ]

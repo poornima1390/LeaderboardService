@@ -25,22 +25,25 @@ databases:
     version: "17"
     production: false
 
-  # NOTE: Redis is deliberately absent.
+  # The rank index (Spec.md D2).
   #
-  # The rank index is derived state, and the service is built to serve
-  # correctly without it: reads fall back to Postgres and /health reports
-  # "degraded" rather than failing (Spec.md D2, §4). DigitalOcean has no dev
-  # tier for managed Valkey/Redis, so attaching one costs ~$15/mo for a
-  # capability Phases 2-3 have not started using yet. Deploying without it
-  # exercises the degraded path for real instead of assuming it works.
+  # `production: true` is not a choice: DigitalOcean has no dev tier for
+  # managed Valkey, unlike Postgres. Referenced by cluster_name rather than
+  # provisioned inline, because the cluster was created first so its TLS
+  # behaviour could be verified before a deploy depended on it.
   #
-  # To add it later:
-  #   - name: leaderboard-cache
-  #     engine: VALKEY
-  #     version: "8"
-  #     production: true
-  # ...then set REDIS_URL to ${leaderboard-cache.DATABASE_URL} on both the
-  # service and the migrate job.
+  # Valkey 8 reports `redis_version: 7.2.4` as a compatibility alias, which
+  # clears the >= 6.2 requirement for ZADD GT — the command the whole outbox
+  # design rests on. The service checks this at startup rather than assuming
+  # it (app/repositories/rank_index.py).
+  #
+  # This remains derived, rebuildable state. Losing it costs a rebuild from
+  # Postgres, never data: POST /v1/admin/leaderboards/rebuild.
+  - name: leaderboard-cache
+    engine: VALKEY
+    version: "8"
+    production: true
+    cluster_name: leaderboard-cache
 
 services:
   - name: api
@@ -82,6 +85,14 @@ services:
         scope: RUN_AND_BUILD_TIME
         value: ${leaderboard-db.DATABASE_URL}
 
+      # DigitalOcean supplies a rediss:// URL. Unlike the Postgres one, its
+      # certificate verifies against the default trust store, so no
+      # ssl_cert_reqs relaxation is needed and full TLS verification is kept.
+      # Verified against the live cluster before deploying.
+      - key: REDIS_URL
+        scope: RUN_TIME
+        value: ${leaderboard-cache.DATABASE_URL}
+
       - key: API_KEY
         scope: RUN_TIME
         type: SECRET
@@ -106,6 +117,9 @@ jobs:
     instance_count: 1
     instance_size_slug: apps-s-1vcpu-0.5gb
     run_command: alembic upgrade head
+    # REDIS_URL is deliberately omitted here: a migration never touches the
+    # rank index, and REDIS_URL is optional in config, so the job simply runs
+    # without one rather than carrying a binding it cannot use.
     envs:
       - key: ENVIRONMENT
         scope: RUN_TIME

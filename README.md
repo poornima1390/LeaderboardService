@@ -179,6 +179,7 @@ documented in [Spec.md §2a](Spec.md).
 | `GET` | `/v1/games` | List registered games. Public. |
 | `GET` | `/v1/games/{id}` | One game. Public. |
 | `POST` | `/v1/admin/games` | Register a game. `X-Admin-Key`. |
+| `POST` | `/v1/admin/leaderboards/rebuild` | Rebuild the index from Postgres. `X-Admin-Key`. |
 | `GET` | `/health` | Readiness. Public. |
 
 Phase 3 adds `GET /v1/games/{id}/leaderboard` and
@@ -286,7 +287,7 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**359 tests, 92% coverage.** 223 unit tests run with no dependencies; 136
+**380 tests, 92% coverage.** 223 unit tests run with no dependencies; 157
 integration tests run against real Postgres and Redis and skip cleanly when
 those are absent.
 

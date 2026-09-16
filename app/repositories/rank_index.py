@@ -141,7 +141,11 @@ async def supports_gt(client: Redis) -> bool:
     """
     try:
         info = await client.info("server")
-        raw = str(info.get("redis_version", "0.0"))
+        # Valkey reports `redis_version` as a compatibility alias (Valkey 8
+        # answers "7.2.4"), so that field is checked first and works today.
+        # `valkey_version` is the fallback in case a future release drops it,
+        # since Valkey has supported GT since its fork point.
+        raw = str(info.get("redis_version") or info.get("valkey_version") or "0.0")
         parts = tuple(int(part) for part in raw.split(".")[:2])
     except (RedisError, OSError, TimeoutError, ValueError):
         return False
