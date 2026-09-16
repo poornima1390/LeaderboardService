@@ -9,7 +9,8 @@ on:
 
 concurrency:
   # Supersede in-flight runs for the same ref: a force-push should not leave
-  # two runs racing to report a status.
+  # two runs racing to report a status. The deploy job opts out of this (see
+  # its own concurrency block) so a rollout is never cancelled half-done.
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
@@ -172,3 +173,113 @@ jobs:
       - name: Container logs
         if: always()
         run: docker logs smoke || true
+
+  # ------------------------------------------------------------------------- #
+  # Continuous deployment
+  #
+  # Deployment is driven from here rather than by App Platform's
+  # `deploy_on_push`, and the difference matters: deploy_on_push reacts to the
+  # push itself, so a commit that fails lint, types or tests would still ship.
+  # This job `needs` all three gates, so CI is genuinely the gate.
+  # ------------------------------------------------------------------------- #
+  deploy:
+    name: Deploy to DigitalOcean
+    runs-on: ubuntu-latest
+    needs: [static, test, docker]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    concurrency:
+      # Deploys queue instead of cancelling. Cancelling a rollout mid-flight
+      # leaves the app in whatever state it had reached, which is the one
+      # outcome worse than deploying slightly later.
+      group: deploy-production
+      cancel-in-progress: false
+
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.app_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Resolve app id
+        id: app
+        # Looked up by name rather than stored as a secret or hardcoded: the
+        # id is not sensitive, and resolving it keeps the workflow working if
+        # the app is ever recreated.
+        run: |
+          app_id=$(doctl apps list --format ID,Spec.Name --no-header \
+            | awk '$2 == "leaderboard-service" {print $1; exit}')
+          if [ -z "$app_id" ]; then
+            echo "::error::No App Platform app named 'leaderboard-service'."
+            echo "::error::Create it first: ./scripts/deploy_do.sh"
+            exit 1
+          fi
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+          echo "Resolved app id: $app_id"
+
+      - name: Deploy
+        id: deploy
+        # The app spec pins the source to the main branch, so creating a
+        # deployment rebuilds from the commit this workflow is running for.
+        # --wait blocks until the rollout is ACTIVE or has failed, which is
+        # what makes a red build mean "not deployed".
+        run: |
+          set -o pipefail
+          doctl apps create-deployment "${{ steps.app.outputs.app_id }}" --wait \
+            --format ID,Phase --no-header | tee /tmp/deploy.txt
+          phase=$(awk '{print $2}' /tmp/deploy.txt | tail -1)
+          if [ "$phase" != "ACTIVE" ]; then
+            echo "::error::Deployment finished in phase $phase"
+            exit 1
+          fi
+          app_url=$(doctl apps get "${{ steps.app.outputs.app_id }}" \
+            --format DefaultIngress --no-header)
+          echo "app_url=$app_url" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the deployed service is serving
+        # App Platform already health-checks the container, but that only
+        # proves the rollout believed itself healthy. This asserts the public
+        # ingress actually answers, which is what a user experiences.
+        #
+        # 200 covers both "ok" and "degraded" -- degraded is a serving state by
+        # design, since reads fall back to Postgres when Redis is absent
+        # (Spec.md D2, §4). Only a non-200 is a failure.
+        run: |
+          url="${{ steps.deploy.outputs.app_url }}"
+          for attempt in $(seq 1 20); do
+            code=$(curl -fsS -o /tmp/health.json -w '%{http_code}' "$url/health" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Healthy: HTTP $code"
+              cat /tmp/health.json
+              status=$(jq -r .status /tmp/health.json)
+              echo "status=$status"
+              [ "$status" = "degraded" ] && \
+                echo "::notice::Serving in degraded mode (no Redis attached) - expected for now"
+              exit 0
+            fi
+            echo "attempt $attempt: HTTP $code"
+            sleep 10
+          done
+          echo "::error::Deployed service never returned 200 from /health"
+          doctl apps logs "${{ steps.app.outputs.app_id }}" api --type run --tail 50 || true
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| App | \`${{ steps.app.outputs.app_id }}\` |"
+            echo "| URL | ${{ steps.deploy.outputs.app_url }} |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -3,6 +3,10 @@
 A real-time global gaming leaderboard REST API. Ranks users by score across
 multiple games, over all-time, daily and weekly windows.
 
+**Live:** <https://leaderboard-service-vjvcq.ondigitalocean.app>
+· [`/health`](https://leaderboard-service-vjvcq.ondigitalocean.app/health)
+· [`/docs`](https://leaderboard-service-vjvcq.ondigitalocean.app/docs)
+
 Postgres is the system of record; Redis sorted sets are a derived, rebuildable
 index that answers rank queries in `O(log N)`. If Redis is unavailable the
 service keeps serving from Postgres and reports `degraded` — it does not fail.
@@ -10,11 +14,16 @@ service keeps serving from Postgres and reports `degraded` — it does not fail.
 **Design rationale, including the tradeoffs that were rejected, is in
 [Spec.md](Spec.md).** This README covers running it.
 
-> **Status: Phase 1 (data layer).** Configuration, logging, the error
-> envelope, readiness, container and CI are complete. The schema, migrations
-> and period bucketing are in place, and the Postgres/Redis ranking agreement
-> that the whole design rests on is verified against both real engines. The
-> `/v1` endpoints land in Phases 2–3 — see [Roadmap](#roadmap).
+> **Status: Phase 1 (data layer), deployed.** Configuration, logging, the
+> error envelope, readiness, container, CI and continuous deployment are
+> complete. The schema, migrations and period bucketing are in place, and the
+> Postgres/Redis ranking agreement the whole design rests on is verified
+> against both real engines. The `/v1` endpoints land in Phases 2–3 — see
+> [Roadmap](#roadmap).
+>
+> The live service currently reports `degraded`, which is correct and
+> deliberate: no Redis is attached, so rank queries would use the Postgres
+> fallback (see [Health](#health-and-observability)).
 
 ---
 
@@ -205,7 +214,7 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**191 tests, 92% coverage.** 132 unit tests run with no dependencies; 59
+**203 tests, 92% coverage.** 144 unit tests run with no dependencies; 59
 integration tests run against real Postgres and Redis and skip cleanly when
 those are absent.
 
@@ -228,37 +237,77 @@ Coverage worth calling out:
   buckets that share no scores.
 - **Float64 precision** — `MAX_SCORE` round-trips through a Redis sorted set
   score without rounding.
+- **TLS mode mapping** — `sslmode=require` must reach asyncpg verbatim and
+  never as `ssl=True`; regression coverage for the bug that broke the first
+  deploy.
 
 ---
 
 ## Deployment
 
-CI (`.github/workflows/ci.yml`) runs lint, `mypy --strict`, tests against real
-Postgres and Redis, a reversible-migration check, a model/migration drift check
-(`alembic check`), and a Docker build whose image is booted and probed.
+### The pipeline
 
-**Not yet deployed.** The App Platform spec and deploy script are complete but
-unapplied, deferred until Phases 2–3 give the service endpoints worth serving.
-Once applied, the spec's `deploy_on_push: true` makes merges to `main` deploy
-automatically.
+`.github/workflows/ci.yml` runs four jobs:
+
+| Job | What it proves |
+|---|---|
+| **Lint & type-check** | `ruff` + `mypy --strict`. Split out so a formatting slip reports in seconds. |
+| **Tests** | 203 tests against real Postgres 17 and Redis 7, plus migrations are reversible (`downgrade base` → `upgrade head`) and have not drifted from the models (`alembic check`). |
+| **Docker build** | The image builds, boots and answers `/health`. A crash-looping container fails here, not on App Platform. |
+| **Deploy** | On `main` only, and only after all three above pass. |
+
+**Deployment is driven by CI, not by App Platform's `deploy_on_push`.** That
+distinction is the point: `deploy_on_push` reacts to the push itself, so a
+commit failing lint or tests would still ship. The deploy job `needs` all three
+gates, so a red build genuinely means "not deployed". It resolves the app by
+name, creates a deployment with `--wait`, then independently curls the public
+ingress — App Platform's own health check only proves the rollout believed
+itself healthy, not that the URL answers. Deploys use a non-cancelling
+concurrency group, because interrupting a rollout half-done is worse than
+deploying a minute later.
+
+### First-time setup
 
 ```bash
 export LB_API_KEY=$(openssl rand -hex 32)
 export LB_ADMIN_API_KEY=$(openssl rand -hex 32)
-./scripts/deploy_do.sh
+./scripts/deploy_do.sh          # creates the app; idempotent, safe to re-run
+gh secret set DIGITALOCEAN_ACCESS_TOKEN   # lets CI deploy thereafter
 ```
 
 The script renders [.do/app.yaml](.do/app.yaml), substituting only our own
 placeholders so App Platform's `${leaderboard-db.DATABASE_URL}` binding passes
-through intact, then creates or updates the app idempotently. No secret is
-committed.
+through intact. No secret is committed.
+
+The spec uses a plain `git` source rather than the GitHub integration, so the
+whole deploy needs only an API token and no interactive OAuth authorization.
 
 Migrations run as a `PRE_DEPLOY` job, never at startup: concurrent instances
-racing to migrate is a reliable way to corrupt a deploy.
+racing to migrate is a reliable way to corrupt a deploy. Verified idempotent —
+the second deployment's migrate job was a no-op.
 
-The deployment attaches Postgres but **not** Redis — DigitalOcean has no free
-managed Valkey tier, so Phase 0 runs the degraded path for real rather than
-pretending it works. `.do/app.yaml` documents the three lines that add it.
+### Redis is deliberately not attached
+
+DigitalOcean has no dev tier for managed Valkey/Redis, so attaching one costs
+~$15/mo for a capability Phases 2–3 have not started using. Running without it
+exercises the degraded path for real instead of assuming it works.
+[.do/app.yaml](.do/app.yaml) documents the four lines that add it.
+
+### One thing this deployment caught that no test could
+
+The first deploy failed its health checks with `SSLCertVerificationError`,
+while the Alembic pre-deploy job connected to the same database successfully.
+That asymmetry was the clue: `app.core.db` mapped a non-empty `sslmode` to
+asyncpg's `ssl=True`, and those are not the same thing. libpq's
+`sslmode=require` means *encrypt without verifying the certificate*;
+`ssl=True` means *encrypt and fully verify*. DigitalOcean's connection string
+asks for `require`, and its CA is not in the container's trust store, so the
+stricter setting the code silently substituted could never have worked.
+
+The migration job succeeded only by accident — `migrations/env.py` set no
+`connect_args` at all, so asyncpg negotiated TLS without verification. The two
+were using different TLS settings against the same database. Both now share
+`asyncpg_connect_args()`, and the mapping has regression tests.
 
 ---
 
@@ -270,7 +319,7 @@ pretending it works. `.do/app.yaml` documents the three lines that add it.
 | **1** | Models, migrations, period bucketing, ranking-agreement proof | ✅ done |
 | **2** | `POST /v1/scores`: UPSERT fan-out, outbox, `ZADD GT` (D1/D4) | next |
 | **3** | `RankingRepository`: Redis Lua + Postgres fallback, both read endpoints (D2/D3) | |
-| **4** | Failure-mode tests, admin rebuild, deployment | |
+| **4** | Failure-mode tests, admin rebuild, Redis attached in production | |
 
 Explicitly out of scope, with reasoning, in [Spec.md §9](Spec.md) — including
 per-user auth, rate limiting, anti-cheat and local-time period boundaries.
