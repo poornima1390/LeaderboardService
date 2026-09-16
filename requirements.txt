@@ -1,0 +1,11 @@
+# Runtime dependencies — pinned exactly for reproducible builds.
+# Verified against Python 3.14 (all resolve to native cp314 wheels).
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+sqlalchemy[asyncio]==2.0.54
+asyncpg==0.31.0
+alembic==1.20.0
+redis==8.1.0
+structlog==26.1.0

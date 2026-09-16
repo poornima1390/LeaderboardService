@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Supersede in-flight runs for the same ref: a force-push should not leave
+  # two runs racing to report a status.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  # Lint and types are split from tests so a formatting failure reports in
+  # seconds without waiting for service containers to boot.
+  static:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: ruff (lint)
+        run: ruff check --output-format=github .
+
+      - name: ruff (format)
+        run: ruff format --check .
+
+      - name: mypy --strict
+        run: mypy app tests
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    # Real Postgres and Redis rather than mocks. The design's central risk is
+    # the two stores disagreeing about ranking (Spec.md D2/D3), and a mock
+    # cannot disagree with anything.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: leaderboard
+          POSTGRES_PASSWORD: leaderboard
+          POSTGRES_DB: leaderboard_test
+          # Byte-wise collation, matching the ordering the rank index relies on.
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U leaderboard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      ENVIRONMENT: ci
+      LOG_LEVEL: WARNING
+      DATABASE_URL: postgresql+asyncpg://leaderboard:leaderboard@localhost:5432/leaderboard_test
+      REDIS_URL: redis://localhost:6379/0
+      API_KEY: 7f3c91ab5e2d4806bc1f9a73de50c284
+      ADMIN_API_KEY: d4a82fe07c6b13594ea2f8db60371cae
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      - name: Verify migrations are reversible
+        # A migration that cannot be rolled back is a deploy that cannot be
+        # aborted. Cheap to check here, expensive to discover during an incident.
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: pytest
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: leaderboard-service:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        # Proves the image boots and serves. No database is attached, so the
+        # expected answer is 503 unhealthy — which still exercises config
+        # loading, the ASGI stack, routing and the error envelope. A container
+        # that crash-loops fails here instead of on App Platform.
+        run: |
+          docker run -d --name smoke -p 8080:8080 \
+            -e ENVIRONMENT=ci \
+            -e DATABASE_URL=postgresql+asyncpg://u:p@127.0.0.1:5432/db \
+            -e API_KEY=7f3c91ab5e2d4806bc1f9a73de50c284 \
+            -e ADMIN_API_KEY=d4a82fe07c6b13594ea2f8db60371cae \
+            leaderboard-service:ci
+
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' http://localhost:8080/health || true)
+            if [ "$code" = "503" ] || [ "$code" = "200" ]; then
+              echo "Service responded with $code"
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Service never became reachable:"
+          docker logs smoke
+          exit 1
+
+      - name: Container logs
+        if: always()
+        run: docker logs smoke || true

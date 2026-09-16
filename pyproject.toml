@@ -1,0 +1,73 @@
+[project]
+name = "leaderboard-service"
+version = "0.1.0"
+description = "Real-time global gaming leaderboard API"
+requires-python = ">=3.13"
+
+# ---------------------------------------------------------------------------
+# Ruff — lint + format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # flake8-bugbear
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "ASYNC",    # async correctness
+    "S",        # bandit security
+    "RUF",
+]
+ignore = [
+    "S101",  # assert — pytest relies on it
+]
+
+[tool.ruff.lint.isort]
+# Without this, `app` is classified as a third-party package and import order
+# drifts between files depending on which directory ruff is invoked from.
+known-first-party = ["app", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]  # hardcoded test credentials are fine
+
+# ---------------------------------------------------------------------------
+# mypy — strict. The service is small enough that there is no excuse not to be.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "integration: requires a live Postgres and/or Redis (skipped when unreachable)",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

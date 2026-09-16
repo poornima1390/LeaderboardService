@@ -1,0 +1,56 @@
+# Local development stack. Brings up the service with both backing stores, so
+# the Redis-backed path (not just the Postgres fallback) is what you exercise.
+#
+#   make up        start everything
+#   make logs      follow the service log
+#   make down      stop and discard volumes
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: leaderboard
+      POSTGRES_PASSWORD: leaderboard
+      POSTGRES_DB: leaderboard
+      # C collation at the cluster level, matching the byte-wise ordering the
+      # rank index depends on (Spec.md D3). The user_id columns also declare
+      # COLLATE "C" explicitly, so this is belt-and-braces.
+      POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C"
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leaderboard -d leaderboard"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # appendonly keeps the index across restarts. It is still derived state —
+    # losing it costs a rebuild, not data (Spec.md D2).
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      ENVIRONMENT: local
+      LOG_LEVEL: DEBUG
+      DATABASE_URL: postgresql+asyncpg://leaderboard:leaderboard@postgres:5432/leaderboard
+      REDIS_URL: redis://redis:6379/0
+      API_KEY: local-dev-api-key-not-for-production
+      ADMIN_API_KEY: local-dev-admin-key-not-for-production
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+volumes:
+  postgres_data:
+  redis_data:
