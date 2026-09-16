@@ -12,10 +12,18 @@ services:
       POSTGRES_USER: leaderboard
       POSTGRES_PASSWORD: leaderboard
       POSTGRES_DB: leaderboard
-      # C collation at the cluster level, matching the byte-wise ordering the
-      # rank index depends on (Spec.md D3). The user_id columns also declare
-      # COLLATE "C" explicitly, so this is belt-and-braces.
-      POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C"
+      # Deliberately a NON-C collation, and explicitly UTF8.
+      #
+      # Ordering correctness comes from the column-level COLLATE "C" on
+      # user_id (Spec.md D3) and is verified to hold regardless of the
+      # database's own collation. Setting the cluster to C here would be
+      # worse than useless: it would mask a column that forgot its COLLATE,
+      # and only production — where we do not control the managed database's
+      # collation — would find out.
+      #
+      # --lc-collate=C is also a trap: initdb then infers SQL_ASCII encoding,
+      # which disables encoding validation entirely.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=en_US.utf8 --lc-ctype=en_US.utf8"
     ports: ["5432:5432"]
     volumes: ["postgres_data:/var/lib/postgresql/data"]
     healthcheck:

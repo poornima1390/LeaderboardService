@@ -15,8 +15,11 @@ import pytest
 TEST_ENV = {
     "ENVIRONMENT": "ci",
     "LOG_LEVEL": "WARNING",
-    "DATABASE_URL": "postgresql+asyncpg://test:test@localhost:5432/leaderboard_test",
-    "REDIS_URL": "redis://localhost:6379/1",
+    # Same values CI uses, so a local run and a CI run exercise the same URLs.
+    "DATABASE_URL": (
+        "postgresql+asyncpg://leaderboard:leaderboard@localhost:5432/leaderboard_test"
+    ),
+    "REDIS_URL": "redis://localhost:6379/0",
     # Deliberately not prefixed with "test"/"changeme"/etc: the config layer
     # rejects placeholder-looking secrets, and these have to clear that bar.
     "API_KEY": "7f3c91ab5e2d4806bc1f9a73de50c284",

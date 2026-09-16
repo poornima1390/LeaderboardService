@@ -56,8 +56,11 @@ jobs:
           POSTGRES_USER: leaderboard
           POSTGRES_PASSWORD: leaderboard
           POSTGRES_DB: leaderboard_test
-          # Byte-wise collation, matching the ordering the rank index relies on.
-          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C"
+          # Deliberately NON-C, so CI is adversarial: a column missing its
+          # COLLATE "C" (Spec.md D3) diverges from Redis here and fails, rather
+          # than passing locally and breaking on a managed database whose
+          # collation we do not control.
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=en_US.utf8 --lc-ctype=en_US.utf8"
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U leaderboard"
@@ -102,6 +105,14 @@ jobs:
         run: |
           alembic downgrade base
           alembic upgrade head
+
+      - name: Verify migrations match the models
+        # `alembic check` fails if autogenerate would produce any operation,
+        # i.e. if the migrations and the ORM models have drifted apart. The
+        # integration tests build their schema from Base.metadata, so without
+        # this gate they could pass against a schema the migrations never
+        # produce -- and the deployed database would differ from the tested one.
+        run: alembic check
 
       - name: pytest
         run: pytest --cov=app --cov-report=term-missing --cov-report=xml

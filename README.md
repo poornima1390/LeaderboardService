@@ -10,10 +10,11 @@ service keeps serving from Postgres and reports `degraded` — it does not fail.
 **Design rationale, including the tradeoffs that were rejected, is in
 [Spec.md](Spec.md).** This README covers running it.
 
-> **Status: Phase 0 (scaffold).** Configuration, structured logging, the error
-> envelope, readiness, container, CI and deployment are complete and tested.
-> The `/v1` scoring and ranking endpoints land in Phases 1–3 — see
-> [Roadmap](#roadmap).
+> **Status: Phase 1 (data layer).** Configuration, logging, the error
+> envelope, readiness, container and CI are complete. The schema, migrations
+> and period bucketing are in place, and the Postgres/Redis ranking agreement
+> that the whole design rests on is verified against both real engines. The
+> `/v1` endpoints land in Phases 2–3 — see [Roadmap](#roadmap).
 
 ---
 
@@ -97,13 +98,32 @@ display names from Postgres in a single query → respond.
 | **D4** | Conditional UPSERT, then a transactional outbox to Redis | `ZADD GT` never lowers a score, making the sync idempotent *and* order-independent, so at-least-once delivery needs no consistency protocol. |
 | **D5** | A board is `(game, period, bucket)` | Weekly/daily boards are the first thing anyone asks for and retrofitting rewrites every query. Cost: a fixed 3× write fan-out. |
 
-Two details in D3 are easy to get wrong and are asserted in the test suite:
+Two details in D3 are easy to get wrong, and both are now verified against
+real Postgres and real Redis rather than argued:
 
 - `ZREVRANGE` and `ZREVRANK` order equal scores by member **descending**, so
   Postgres must be `user_id DESC` — not `ASC`.
 - Redis compares member bytes; Postgres `text` ordering follows the database
   collation, which is generally *not* byte-wise. Hence `COLLATE "C"` on the
-  column, so no future query can drift away from Redis.
+  column.
+
+The second point was measured, because it is the one that would otherwise pass
+locally and fail in production. Inside a database whose own collation is
+`en_US.utf8`, the two orderings are:
+
+```
+redis         : alpha, player_a, player_99, player_77, player_2, player_1204, ...
+pg COLLATE C  : alpha, player_a, player_99, player_77, player_2, player_1204, ...   agrees
+pg default    : alpha, player.c, player-b, Player_A, player_a, player_99, ...       diverges
+```
+
+glibc collation reorders punctuation and case, so a column that omits
+`COLLATE "C"` silently produces a different leaderboard from the rank index.
+Because the guarantee lives on the *column*, it holds regardless of the
+managed database's own collation — which we do not control on DigitalOcean.
+Local and CI Postgres are therefore configured with a deliberately **non-C**
+collation, so a column that forgets its `COLLATE` fails the build instead of
+passing and breaking in production.
 
 "Earliest achiever wins a tie" would be the better product rule, but a Redis
 ZSET score is a `double` with 53 bits of exact integer precision. Packing an
@@ -185,17 +205,42 @@ real Postgres 17 and Redis 7 service containers — the design's central risk is
 the two stores disagreeing about ranking, and a mock cannot disagree with
 anything.
 
-**Phase 0: 83 tests.** Covering configuration and its fail-fast guarantees,
-the health status mapping, the error envelope across every failure path, and
-request-id handling including hostile input.
+**191 tests, 92% coverage.** 132 unit tests run with no dependencies; 59
+integration tests run against real Postgres and Redis and skip cleanly when
+those are absent.
+
+Coverage worth calling out:
+
+- **Ranking agreement (D2/D3)** — the same standings written to both stores
+  must produce identical ordering, ranks, windows and totals. Checked against
+  adversarial identifiers (case, punctuation, numeric-looking suffixes) and
+  across 40 seeded random boards with a deliberately small score range, so
+  ties — the only place the stores can disagree — are common.
+- **Constraints** — every CHECK and foreign key is tested by trying to violate
+  it. A constraint nobody has seen reject anything is a comment, not a
+  guarantee.
+- **Index usage** — `EXPLAIN` asserts top-N is an index-only scan with no
+  `Sort` node. Without the index the query still returns correct rows, so only
+  the plan catches the regression, and the Postgres path is the fallback that
+  runs when the system is already under stress.
+- **ISO week boundaries** — `2027-01-01` belongs to ISO week 53 of *2026*.
+  Using the calendar year would split one week's leaderboard across two
+  buckets that share no scores.
+- **Float64 precision** — `MAX_SCORE` round-trips through a Redis sorted set
+  score without rounding.
 
 ---
 
 ## Deployment
 
 CI (`.github/workflows/ci.yml`) runs lint, `mypy --strict`, tests against real
-services, a reversible-migration check, and a Docker build whose image is
-booted and probed. Merges to `main` auto-deploy to App Platform.
+Postgres and Redis, a reversible-migration check, a model/migration drift check
+(`alembic check`), and a Docker build whose image is booted and probed.
+
+**Not yet deployed.** The App Platform spec and deploy script are complete but
+unapplied, deferred until Phases 2–3 give the service endpoints worth serving.
+Once applied, the spec's `deploy_on_push: true` makes merges to `main` deploy
+automatically.
 
 ```bash
 export LB_API_KEY=$(openssl rand -hex 32)
@@ -221,11 +266,11 @@ pretending it works. `.do/app.yaml` documents the three lines that add it.
 
 | Phase | Scope | Status |
 |---|---|---|
-| **0** | Config, logging, error envelope, `/health`, Docker, CI, deployment | ✅ done |
-| **1** | Models, migrations, period bucketing (D5) | next |
-| **2** | `POST /v1/scores`: UPSERT fan-out, outbox, `ZADD GT` (D1/D4) | |
+| **0** | Config, logging, error envelope, `/health`, Docker, CI | ✅ done |
+| **1** | Models, migrations, period bucketing, ranking-agreement proof | ✅ done |
+| **2** | `POST /v1/scores`: UPSERT fan-out, outbox, `ZADD GT` (D1/D4) | next |
 | **3** | `RankingRepository`: Redis Lua + Postgres fallback, both read endpoints (D2/D3) | |
-| **4** | Differential property tests, failure-mode tests, admin rebuild | |
+| **4** | Failure-mode tests, admin rebuild, deployment | |
 
 Explicitly out of scope, with reasoning, in [Spec.md §9](Spec.md) — including
 per-user auth, rate limiting, anti-cheat and local-time period boundaries.
@@ -234,16 +279,19 @@ per-user auth, rate limiting, anti-cheat and local-time period boundaries.
 
 ```
 app/
-  main.py              app factory, lifespan
-  api/health.py        readiness, with injectable probes
-  core/config.py       Settings; fail-fast validation, DO URL normalisation
-  core/errors.py       error codes, envelope, handlers
-  core/logging.py      structlog over the stdlib bridge
-  core/middleware.py   request ids, access log, body size limit
-  core/db.py           engine and Redis client lifecycle
-migrations/            Alembic; URL comes from app settings
-tests/unit/            no live dependencies needed
-tests/integration/     marked `integration`
-.do/app.yaml           App Platform spec (placeholders, no secrets)
-scripts/deploy_do.sh   idempotent create-or-update deploy
+  main.py                app factory, lifespan
+  api/health.py          readiness, with injectable probes
+  core/config.py         Settings; fail-fast validation, DO URL normalisation
+  core/errors.py         error codes, envelope, handlers
+  core/logging.py        structlog over the stdlib bridge
+  core/middleware.py     request ids, access log, body size limit
+  core/db.py             engine and Redis client lifecycle
+  domain/periods.py      Period, BoardKey, UTC bucketing, D5 fan-out
+  domain/identifiers.py  id patterns and score bounds, shared by API + schema
+  models/entities.py     the four tables; COLLATE "C" lives here
+migrations/              Alembic; URL comes from app settings
+tests/unit/              no live dependencies needed
+tests/integration/       real Postgres + Redis; skipped when absent
+.do/app.yaml             App Platform spec (placeholders, no secrets)
+scripts/deploy_do.sh     idempotent create-or-update deploy
 ```
